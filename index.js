@@ -2,16 +2,13 @@ import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  ChannelType,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle
+  ChannelType
 } from "discord.js";
-import pkg from "pg";
+import pg from "pg";
 import dotenv from "dotenv";
 
 dotenv.config();
-const { Pool } = pkg;
+const { Pool } = pg;
 
 /* =========================
    CLIENT
@@ -27,6 +24,10 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+// Test DB connection (Railway-safe)
+await pool.query("SELECT 1");
+console.log("✅ PostgreSQL connected");
 
 /* =========================
    INIT TABLES
@@ -62,7 +63,6 @@ CREATE TABLE IF NOT EXISTS matches (
 ========================= */
 const QUEUE_CHANNEL_ID = process.env.QUEUE_CHANNEL_ID;
 const REPORT_CHANNEL_ID = process.env.REPORT_CHANNEL_ID;
-const STATS_CHANNEL_ID = process.env.STATS_CHANNEL_ID;
 const CATEGORY_MATCH_ID = process.env.CATEGORY_MATCH_ID;
 const CATEGORY_VOICE_ID = process.env.CATEGORY_VOICE_ID;
 
@@ -106,9 +106,11 @@ async function updateQueueEmbeds(guild) {
 
     const embed = new EmbedBuilder()
       .setTitle(`📊 ${format.toUpperCase()} Queue`)
-      .setColor(0x00AE86)
+      .setColor(0x00ae86)
       .setDescription(
-        players.length ? players.map(p => `<@${p}>`).join("\n") : "_No players queued_"
+        players.length
+          ? players.map(p => `<@${p}>`).join("\n")
+          : "_No players queued_"
       )
       .setFooter({ text: `${players.length} / ${needed}` });
 
@@ -160,7 +162,8 @@ async function createMatch(guild, format, teamA, teamB) {
 
   await pool.query(
     `INSERT INTO matches
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE)`,
+     (id, format, map, mode, captainA, captainB, channel_id, vcA, vcB, teamA, teamB)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
     [
       matchId,
       format,
@@ -190,13 +193,13 @@ async function createMatch(guild, format, teamA, teamB) {
     )
     .setFooter({ text: `Report with /report ${matchId}` });
 
-  textChannel.send({ embeds: [embed] });
+  await textChannel.send({ embeds: [embed] });
 }
 
 /* =========================
    READY
 ========================= */
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   client.guilds.cache.forEach(g => updateQueueEmbeds(g));
 });
@@ -207,9 +210,10 @@ client.once("ready", () => {
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
+  /* ===== REPORT ===== */
   if (interaction.commandName === "report") {
     if (interaction.channel.id !== REPORT_CHANNEL_ID) {
-      return interaction.reply({ content: "Wrong channel.", ephemeral: true });
+      return interaction.reply({ content: "❌ Wrong channel.", ephemeral: true });
     }
 
     const matchId = interaction.options.getString("match_id");
@@ -221,17 +225,26 @@ client.on("interactionCreate", async interaction => {
     );
 
     if (!rows.length) {
-      return interaction.reply({ content: "Invalid or reported match.", ephemeral: true });
+      return interaction.reply({ content: "❌ Match not found or already reported.", ephemeral: true });
     }
 
     const match = rows[0];
 
-    if (![match.capitana, match.captainb].includes(interaction.user.id)) {
-      return interaction.reply({ content: "Only captains can report.", ephemeral: true });
+    const captainA = match.capitana;
+    const captainB = match.captainb;
+
+    if (interaction.user.id !== captainA && interaction.user.id !== captainB) {
+      return interaction.reply({
+        content: "❌ Only captains can report this match.",
+        ephemeral: true
+      });
     }
 
-    const winners = result === "A" ? match.teama : match.teamb;
-    const losers = result === "A" ? match.teamb : match.teama;
+    const teamA = match.teama;
+    const teamB = match.teamb;
+
+    const winners = result === "A" ? teamA : teamB;
+    const losers = result === "A" ? teamB : teamA;
 
     for (const p of winners) {
       await pool.query(
@@ -252,7 +265,7 @@ client.on("interactionCreate", async interaction => {
       [result, matchId]
     );
 
-    interaction.reply({ content: "✅ Match reported.", ephemeral: true });
+    await interaction.reply({ content: "✅ Match reported successfully.", ephemeral: true });
   }
 });
 
