@@ -3,6 +3,15 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+const TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID; // Your bot's client ID
+const GUILD_ID = process.env.GUILD_ID;   // Your test server ID
+
+if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
+  console.error("❌ Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID in .env");
+  process.exit(1);
+}
+
 const commands = [
   // ===== Queue =====
   new SlashCommandBuilder()
@@ -39,7 +48,7 @@ const commands = [
     .setName("leaderboard")
     .setDescription("View ELO leaderboard"),
 
-  // ===== Report (ENV-BASED MATCH ID) =====
+  // ===== Report =====
   new SlashCommandBuilder()
     .setName("report")
     .setDescription("Report match result (captains only)")
@@ -53,12 +62,12 @@ const commands = [
         .setDescription("Which team won")
         .setRequired(true)
         .addChoices(
-          { name: "Team A", value: "win" },
-          { name: "Team B", value: "loss" }
+          { name: "Team A", value: "A" },
+          { name: "Team B", value: "B" }
         )
     ),
 
-  // ===== Mod ELO Adjustment =====
+  // ===== Adjust ELO (Admin/Mod Only) =====
   new SlashCommandBuilder()
     .setName("adjustelo")
     .setDescription("Adjust a player's ELO (mods only)")
@@ -78,26 +87,29 @@ const commands = [
         .setRequired(false)
     ),
 
-  // ===== Rules Command =====
+  // ===== Rules =====
   new SlashCommandBuilder()
     .setName("rules")
     .setDescription("View the rules and how to play")
 ].map(command => command.toJSON());
 
-const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-
-const CLIENT_ID = 1450391424569966642; // your bot client id
-const GUILD_ID = 1354200815169961984;   // your test server id
+const rest = new REST({ version: "10" }).setToken(TOKEN);
 
 (async () => {
   try {
-    console.log("Registering slash commands...");
+    console.log(`🚀 Started refreshing ${commands.length} slash commands...`);
+
+    // Guild-based commands (fast, instant update)
     await rest.put(
       Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
       { body: commands }
     );
-    console.log("Slash commands registered successfully.");
+
+    // Uncomment below for global commands (may take up to 1 hour to update)
+    // await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+
+    console.log(`✅ Successfully registered ${commands.length} slash commands.`);
   } catch (error) {
-    console.error(error);
+    console.error("❌ Failed to deploy commands:", error);
   }
 })();
