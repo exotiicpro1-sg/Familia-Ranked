@@ -2,88 +2,53 @@ import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  ChannelType
+  PermissionsBitField
 } from "discord.js";
-import pg from "pg";
 import dotenv from "dotenv";
+import pkg from "pg";
 
 dotenv.config();
-const { Pool } = pg;
+const { Pool } = pkg;
 
-/* =========================
-   CLIENT
-========================= */
+/* ================== CONFIG ================== */
+const TOKEN = process.env.DISCORD_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+const GUILD_ID = "YOUR_GUILD_ID";
+const QUEUE_CHANNEL_ID = "QUEUE_CHANNEL_ID";
+const ADMIN_ROLE_ID = "ADMIN_ROLE_ID";
+
+/* ================== CLIENT ================== */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers
+  ]
 });
 
-/* =========================
-   DATABASE (POSTGRES)
-========================= */
+/* ================== DATABASE ================== */
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Test DB connection (Railway-safe)
-await pool.query("SELECT 1");
-console.log("✅ PostgreSQL connected");
+/* ================== CONSTANTS ================== */
+const formats = {
+  bo3: { players: 6 },
+  bo5: { players: 8 },
+  bo7: { players: 10 }
+};
 
-/* =========================
-   INIT TABLES
-========================= */
-await pool.query(`
-CREATE TABLE IF NOT EXISTS players (
-  id TEXT PRIMARY KEY,
-  username TEXT,
-  wins INT DEFAULT 0,
-  losses INT DEFAULT 0,
-  elo INT DEFAULT 1000
-);
+const maps = ["Rio", "Highrise", "Invasion", "Karachi", "Sub Base"];
+const modes = ["Hardpoint", "Search & Destroy", "Control"];
 
-CREATE TABLE IF NOT EXISTS matches (
-  id TEXT PRIMARY KEY,
-  format TEXT,
-  map TEXT,
-  mode TEXT,
-  captainA TEXT,
-  captainB TEXT,
-  channel_id TEXT,
-  vcA TEXT,
-  vcB TEXT,
-  teamA JSONB,
-  teamB JSONB,
-  winner TEXT,
-  reported BOOLEAN DEFAULT FALSE
-);
-`);
+const queues = { bo3: [], bo5: [], bo7: [] };
+const activeMatches = new Map();
 
-/* =========================
-   CONFIG
-========================= */
-const QUEUE_CHANNEL_ID = process.env.QUEUE_CHANNEL_ID;
-const REPORT_CHANNEL_ID = process.env.REPORT_CHANNEL_ID;
-const CATEGORY_MATCH_ID = process.env.CATEGORY_MATCH_ID;
-const CATEGORY_VOICE_ID = process.env.CATEGORY_VOICE_ID;
-
-/* =========================
-   MAPS & MODES
-========================= */
-const MAPS = ["Skidrow", "Terminal", "Highrise", "Invasion"];
-const MODES = ["Hardpoint", "Search & Destroy", "Control"];
-const pick = arr => arr[Math.floor(Math.random() * arr.length)];
-
-/* =========================
-   QUEUES
-========================= */
-const formats = { "8s": 8, "6s": 6, "4s": 4 };
-let queues = { "8s": [], "6s": [], "4s": [] };
-let queueMessages = {};
-
-/* =========================
-   HELPERS
-========================= */
-const id = () => Math.random().toString(36).slice(2, 9);
+/* ================== HELPERS ================== */
+const isAdmin = (member) =>
+  member.roles.cache.has(ADMIN_ROLE_ID) ||
+  member.permissions.has(PermissionsBitField.Flags.Administrator);
 
 async function ensurePlayer(user) {
   await pool.query(
@@ -94,188 +59,232 @@ async function ensurePlayer(user) {
   );
 }
 
-/* =========================
-   QUEUE EMBEDS
-========================= */
 async function updateQueueEmbeds(guild) {
-  const channel = await guild.channels.fetch(QUEUE_CHANNEL_ID);
+  const channel = guild.channels.cache.get(QUEUE_CHANNEL_ID);
+  if (!channel) return;
 
-  for (const format of Object.keys(formats)) {
-    const needed = formats[format];
-    const players = queues[format];
+  await channel.bulkDelete(10, true);
 
+  for (const format of Object.keys(queues)) {
     const embed = new EmbedBuilder()
-      .setTitle(`📊 ${format.toUpperCase()} Queue`)
-      .setColor(0x00ae86)
+      .setTitle(`${format.toUpperCase()} Queue`)
       .setDescription(
-        players.length
-          ? players.map(p => `<@${p}>`).join("\n")
-          : "_No players queued_"
+        queues[format].length
+          ? queues[format].map((id) => `<@${id}>`).join("\n")
+          : "Empty"
       )
-      .setFooter({ text: `${players.length} / ${needed}` });
+      .setColor(0x00ffcc);
 
-    if (!queueMessages[format]) {
-      const msg = await channel.send({ embeds: [embed] });
-      queueMessages[format] = msg.id;
-    } else {
-      const msg = await channel.messages.fetch(queueMessages[format]);
-      await msg.edit({ embeds: [embed] });
-    }
-
-    if (players.length >= needed) {
-      const teamA = players.splice(0, needed / 2);
-      const teamB = players.splice(0, needed / 2);
-      await createMatch(guild, format, teamA, teamB);
-      await updateQueueEmbeds(guild);
-    }
+    await channel.send({ embeds: [embed] });
   }
 }
 
-/* =========================
-   MATCH CREATION
-========================= */
-async function createMatch(guild, format, teamA, teamB) {
-  const matchId = id();
-  const map = pick(MAPS);
-  const mode = pick(MODES);
+function randomFrom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
 
-  const captainA = teamA[0];
-  const captainB = teamB[0];
+/* ================== MATCH CREATION ================== */
+async function tryCreateMatch(format, guild) {
+  if (queues[format].length < formats[format].players) return;
 
-  const textChannel = await guild.channels.create({
-    name: `${captainA}-vs-${captainB}`,
-    type: ChannelType.GuildText,
-    parent: CATEGORY_MATCH_ID
+  const players = queues[format].splice(0, formats[format].players);
+  const captainA = players[0];
+  const captainB = players[1];
+
+  const teamA = players.filter((_, i) => i % 2 === 0);
+  const teamB = players.filter((_, i) => i % 2 !== 0);
+
+  const map = randomFrom(maps);
+  const mode = randomFrom(modes);
+
+  const channel = await guild.channels.create({
+    name: `match-${Date.now()}`,
+    type: 0
   });
 
-  const vcA = await guild.channels.create({
-    name: "Team A",
-    type: ChannelType.GuildVoice,
-    parent: CATEGORY_VOICE_ID
-  });
+  const matchId = channel.id;
 
-  const vcB = await guild.channels.create({
-    name: "Team B",
-    type: ChannelType.GuildVoice,
-    parent: CATEGORY_VOICE_ID
+  activeMatches.set(matchId, {
+    format,
+    captainA,
+    captainB,
+    teamA,
+    teamB,
+    channelId: channel.id
   });
 
   await pool.query(
     `INSERT INTO matches
-     (id, format, map, mode, captainA, captainB, channel_id, vcA, vcB, teamA, teamB)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+     (id, format, captain_a, captain_b, team_a, team_b, map, mode)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
     [
       matchId,
       format,
-      map,
-      mode,
       captainA,
       captainB,
-      textChannel.id,
-      vcA.id,
-      vcB.id,
       JSON.stringify(teamA),
-      JSON.stringify(teamB)
+      JSON.stringify(teamB),
+      map,
+      mode
     ]
   );
 
   const embed = new EmbedBuilder()
-    .setTitle(`🏆 Match ${matchId}`)
-    .setColor(0xffb703)
+    .setTitle("🎮 Match Created")
     .addFields(
       { name: "Format", value: format.toUpperCase(), inline: true },
       { name: "Map", value: map, inline: true },
       { name: "Mode", value: mode, inline: true },
       { name: "Captain A", value: `<@${captainA}>`, inline: true },
       { name: "Captain B", value: `<@${captainB}>`, inline: true },
-      { name: "Team A", value: teamA.map(p => `<@${p}>`).join("\n") },
-      { name: "Team B", value: teamB.map(p => `<@${p}>`).join("\n") }
+      {
+        name: "Team A",
+        value: teamA.map((id) => `<@${id}>`).join("\n")
+      },
+      {
+        name: "Team B",
+        value: teamB.map((id) => `<@${id}>`).join("\n")
+      }
     )
-    .setFooter({ text: `Report with /report ${matchId}` });
+    .setColor(0xff9900);
 
-  await textChannel.send({ embeds: [embed] });
+  await channel.send({ embeds: [embed] });
 }
 
-/* =========================
-   READY
-========================= */
+/* ================== EVENTS ================== */
 client.once("ready", async () => {
-  console.log(`🤖 Logged in as ${client.user.tag}`);
-  client.guilds.cache.forEach(g => updateQueueEmbeds(g));
+  console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-/* =========================
-   INTERACTIONS
-========================= */
-client.on("interactionCreate", async interaction => {
+/* ================== COMMAND HANDLER ================== */
+client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
+  const { commandName, guild, member } = interaction;
 
-  /* ===== REPORT ===== */
-  if (interaction.commandName === "report") {
-    if (interaction.channel.id !== REPORT_CHANNEL_ID) {
-      return interaction.reply({ content: "❌ Wrong channel.", ephemeral: true });
+  /* ===== QUEUE ===== */
+  if (commandName === "queue") {
+    if (interaction.channel.id !== QUEUE_CHANNEL_ID)
+      return interaction.reply({ content: "❌ Use the queue channel.", ephemeral: true });
+
+    const format = interaction.options.getString("format");
+    if (!formats[format])
+      return interaction.reply({ content: "❌ Invalid format.", ephemeral: true });
+
+    if (queues[format].includes(interaction.user.id))
+      return interaction.reply({ content: "❌ Already queued.", ephemeral: true });
+
+    await ensurePlayer(interaction.user);
+    queues[format].push(interaction.user.id);
+
+    await updateQueueEmbeds(guild);
+    await tryCreateMatch(format, guild);
+
+    return interaction.reply({ content: "✅ Joined queue.", ephemeral: true });
+  }
+
+  /* ===== LEAVE ===== */
+  if (commandName === "leave") {
+    let removed = false;
+    for (const f of Object.keys(queues)) {
+      const i = queues[f].indexOf(interaction.user.id);
+      if (i !== -1) {
+        queues[f].splice(i, 1);
+        removed = true;
+      }
     }
 
-    const matchId = interaction.options.getString("match_id");
-    const result = interaction.options.getString("result");
+    if (!removed)
+      return interaction.reply({ content: "❌ Not in a queue.", ephemeral: true });
 
-    const { rows } = await pool.query(
-      `SELECT * FROM matches WHERE id=$1 AND reported=FALSE`,
-      [matchId]
+    await updateQueueEmbeds(guild);
+    return interaction.reply({ content: "✅ Left queue.", ephemeral: true });
+  }
+
+  /* ===== REPORT / FORCE REPORT ===== */
+  if (commandName === "report" || commandName === "force-report") {
+    const matchId = interaction.options.getString("match_id", true);
+    const result = interaction.options.getString("result", true);
+
+    const res = await pool.query(`SELECT * FROM matches WHERE id=$1`, [matchId]);
+    if (!res.rows.length)
+      return interaction.reply({ content: "❌ Match not found.", ephemeral: true });
+
+    const match = res.rows[0];
+
+    const teamA = Array.isArray(match.team_a) ? match.team_a : JSON.parse(match.team_a);
+    const teamB = Array.isArray(match.team_b) ? match.team_b : JSON.parse(match.team_b);
+
+    if (commandName === "report") {
+      if (
+        interaction.user.id !== match.captain_a &&
+        interaction.user.id !== match.captain_b &&
+        !isAdmin(member)
+      ) {
+        return interaction.reply({
+          content: "❌ Only captains or admins can report.",
+          ephemeral: true
+        });
+      }
+    }
+
+    if (commandName === "force-report" && !isAdmin(member)) {
+      return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+    }
+
+    const winners = result === "team_a" ? teamA : teamB;
+    const losers = result === "team_a" ? teamB : teamA;
+
+    for (const id of winners)
+      await pool.query(
+        `UPDATE players SET wins = wins + 1 WHERE id=$1`,
+        [id]
+      );
+
+    for (const id of losers)
+      await pool.query(
+        `UPDATE players SET losses = losses + 1 WHERE id=$1`,
+        [id]
+      );
+
+    await pool.query(`DELETE FROM matches WHERE id=$1`, [matchId]);
+    activeMatches.delete(matchId);
+
+    const channel = guild.channels.cache.get(matchId);
+    if (channel) setTimeout(() => channel.delete().catch(() => {}), 5000);
+
+    return interaction.reply({ content: "✅ Match reported.", ephemeral: true });
+  }
+
+  /* ===== STATS ===== */
+  if (commandName === "stats") {
+    const user = interaction.options.getUser("player") || interaction.user;
+    const res = await pool.query(`SELECT * FROM players WHERE id=$1`, [user.id]);
+
+    if (!res.rows.length)
+      return interaction.reply({ content: "❌ No stats.", ephemeral: true });
+
+    const p = res.rows[0];
+    return interaction.reply(
+      `📊 **${user.username}** — Wins: ${p.wins} | Losses: ${p.losses}`
+    );
+  }
+
+  /* ===== LEADERBOARD ===== */
+  if (commandName === "leaderboard") {
+    const res = await pool.query(
+      `SELECT username, wins FROM players ORDER BY wins DESC LIMIT 10`
     );
 
-    if (!rows.length) {
-      return interaction.reply({ content: "❌ Match not found or already reported.", ephemeral: true });
-    }
+    const embed = new EmbedBuilder()
+      .setTitle("🏆 Leaderboard")
+      .setDescription(
+        res.rows.map((p, i) => `**${i + 1}.** ${p.username} — ${p.wins}W`).join("\n")
+      )
+      .setColor(0x00ff00);
 
-    const match = rows[0];
-
-    const captainA = match.capitana;
-    const captainB = match.captainb;
-
-    if (interaction.user.id !== captainA && interaction.user.id !== captainB) {
-      return interaction.reply({
-        content: "❌ Only captains can report this match.",
-        ephemeral: true
-      });
-    }
-
-    const teamA = match.teama;
-    const teamB = match.teamb;
-
-    const winners = result === "A" ? teamA : teamB;
-    const losers = result === "A" ? teamB : teamA;
-
-    for (const p of winners) {
-      await pool.query(
-        `UPDATE players SET wins=wins+1, elo=elo+10 WHERE id=$1`,
-        [p]
-      );
-    }
-
-    for (const p of losers) {
-      await pool.query(
-        `UPDATE players SET losses=losses+1, elo=GREATEST(0, elo-10) WHERE id=$1`,
-        [p]
-      );
-    }
-
-    await pool.query(
-      `UPDATE matches SET reported=TRUE, winner=$1 WHERE id=$2`,
-      [result, matchId]
-    );
-
-    await interaction.reply({ content: "✅ Match reported successfully.", ephemeral: true });
+    return interaction.reply({ embeds: [embed] });
   }
 });
 
-/* =========================
-   SAFETY
-========================= */
-process.on("unhandledRejection", console.error);
-process.on("uncaughtException", console.error);
-
-/* =========================
-   LOGIN
-========================= */
-client.login(process.env.DISCORD_TOKEN);
+/* ================== LOGIN ================== */
+client.login(TOKEN);
