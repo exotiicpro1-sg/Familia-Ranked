@@ -1,0 +1,14 @@
+{
+  "name": "familia-ranked",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^13.17.1",
+    "dotenv": "^16.4.5",
+    "pg": "^8.11.5"
+  }
+}
